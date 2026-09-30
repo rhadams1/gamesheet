@@ -8,3 +8,4 @@ venv/
 *.json
 *.html
 .DS_Store
+!tests/fixtures/*.json

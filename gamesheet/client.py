@@ -9,7 +9,15 @@ from typing import Optional
 
 import requests
 
-from .config import API_BASE, FIRESTORE_BASE, MAX_RETRIES, REQUEST_TIMEOUT
+from .config import (
+    API_BASE,
+    BROWSER_HEADERS,
+    FIRESTORE_BASE,
+    MAX_RETRIES,
+    REQUEST_TIMEOUT,
+    SEASON_GAMES_CACHE_TTL,
+    SITE_BASE,
+)
 from .models import (
     Division,
     Game,
@@ -34,8 +42,11 @@ class GameSheetClient:
     def __init__(self, season_id: str):
         self.season_id = season_id
         self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session.headers.update(BROWSER_HEADERS)
+        self._session.headers["Referer"] = f"{SITE_BASE}/seasons/{season_id}/games"
         self._divisions_cache: list[Division] | None = None
+        # (games, expires_at) — shared by get_schedule/get_scores/get_divisions
+        self._season_games_cache: tuple[list[Game], float] | None = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -85,7 +96,7 @@ class GameSheetClient:
 
     @staticmethod
     def _parse_record_string(record_str: str) -> dict[str, int]:
-        """Parse '(W - L - T)' or '(W - L - T - OTL)' into dict."""
+        """Parse 'W-L-T-OTL' or '(W - L - T)' style records into a dict."""
         nums = [int(x) for x in re.findall(r"\d+", record_str)]
         result = {"wins": 0, "losses": 0, "ties": 0, "otl": 0}
         if len(nums) >= 3:
@@ -97,20 +108,110 @@ class GameSheetClient:
         return result
 
     # ------------------------------------------------------------------
-    # REST API — Divisions
+    # REST API — Season games (unified-games: schedule + scores in one call)
+    # ------------------------------------------------------------------
+
+    def get_season_games(self, page_size: int = 500, use_cache: bool = True) -> list[Game]:
+        """Fetch every game in the season (scheduled, live and final).
+
+        Uses ``/api/unified-games/<season>``, which returns teams, logos,
+        divisions, rink, status and per-period goals for all games. Pages
+        through ``limit``/``offset`` until ``meta.total`` is reached.
+        """
+        if use_cache and self._season_games_cache is not None:
+            games, expires_at = self._season_games_cache
+            if time.time() < expires_at:
+                return games
+
+        url = f"{API_BASE}/unified-games/{self.season_id}"
+        games: list[Game] = []
+        offset = 0
+        while True:
+            payload = self._get(url, {
+                "order": "asc",
+                "limit": str(page_size),
+                "offset": str(offset),
+            }).json()
+            page = payload.get("data", [])
+            games.extend(self._parse_unified_game(item) for item in page)
+            total = (payload.get("meta") or {}).get("total", len(games))
+            offset += len(page)
+            if not page or offset >= total:
+                break
+
+        self._season_games_cache = (games, time.time() + SEASON_GAMES_CACHE_TTL)
+        return games
+
+    def _parse_unified_game(self, item: dict) -> Game:
+        """Parse one game from the unified-games endpoint."""
+        home = item.get("home", {}) or {}
+        visitor = item.get("visitor", {}) or {}
+        status = item.get("status", "")
+
+        periods: dict[str, dict[str, int]] = {}
+        if status != "scheduled":
+            h_periods = home.get("goalsByPeriod", {}) or {}
+            v_periods = visitor.get("goalsByPeriod", {}) or {}
+            for label in h_periods:
+                if label == "final":
+                    continue
+                periods[label] = {
+                    "home": int(h_periods.get(label) or 0),
+                    "visitor": int(v_periods.get(label) or 0),
+                }
+            periods["total"] = {
+                "home": int(home.get("goals") or 0),
+                "visitor": int(visitor.get("goals") or 0),
+            }
+
+        return Game(
+            id=str(item.get("gameId", "")),
+            season_id=self.season_id,
+            status=status,
+            game_type=item.get("gameType", ""),
+            game_number=str(item.get("number", "")),
+            location=item.get("location", ""),
+            scheduled_time=item.get("time", ""),
+            date=item.get("date", ""),
+            home=self._unified_team(home),
+            visitor=self._unified_team(visitor),
+            scoreboard=Scoreboard(periods=periods),
+            has_overtime=any(k.startswith("ot") for k in periods),
+            has_shootout=any(k.startswith("so") for k in periods),
+        )
+
+    def _unified_team(self, data: dict) -> Team:
+        division = data.get("division", {}) or {}
+        return Team(
+            name=data.get("title", ""),
+            id=str(data.get("id", "")),
+            logo_url=data.get("logo", ""),
+            division=division.get("title", ""),
+            division_id=str(division.get("id", "")),
+            **self._parse_record_string(data.get("overallRecord", "")),
+        )
+
+    @staticmethod
+    def _in_division(game: Game, division_id: str) -> bool:
+        return division_id in (game.home.division_id, game.visitor.division_id)
+
+    # ------------------------------------------------------------------
+    # Divisions / schedule / scores — thin views over get_season_games()
+    # (the old useSeasonDivisions / useSchedule / useScoredGames endpoints
+    # were removed by GameSheet and now return 404)
     # ------------------------------------------------------------------
 
     def get_divisions(self) -> list[Division]:
-        """List all divisions for the season."""
+        """List all divisions that have games this season."""
         if self._divisions_cache is not None:
             return self._divisions_cache
 
-        url = f"{API_BASE}/useSeasonDivisions/getDivisions/{self.season_id}"
-        data = self._get(url).json()
-
-        divisions = [
-            Division(id=str(d["id"]), title=d["title"]) for d in data
-        ]
+        seen: dict[str, str] = {}
+        for game in self.get_season_games():
+            for team in (game.home, game.visitor):
+                if team.division_id and team.division_id not in seen:
+                    seen[team.division_id] = team.division
+        divisions = [Division(id=i, title=t) for i, t in sorted(seen.items(), key=lambda kv: kv[1])]
         self._divisions_cache = divisions
         return divisions
 
@@ -121,99 +222,17 @@ class GameSheetClient:
                 return div.id
         return None
 
-    # ------------------------------------------------------------------
-    # REST API — Scores (completed games)
-    # ------------------------------------------------------------------
-
     def get_scores(
         self,
         division_id: str,
         game_type: str = "overall",
         include_exhibition: bool = False,
     ) -> list[Game]:
-        """Fetch completed game results for a division.
-
-        Args:
-            division_id: Division ID from get_divisions().
-            game_type: "overall" or "exhibition".
-            include_exhibition: If True, also fetch exhibition games and
-                merge them into the result.
-        """
-        base = f"{API_BASE}/useScoredGames/getSeasonScores/{self.season_id}"
-        params = {
-            "filter[divisions]": division_id,
-            "filter[gametype]": game_type,
-            "filter[limit]": "0",
-        }
-        data = self._get(base, params).json()
-        games = [self._parse_rest_scored_game(item) for item in data]
-
-        if include_exhibition and game_type != "exhibition":
-            params["filter[gametype]"] = "exhibition"
-            ex_data = self._get(base, params).json()
-            games.extend(self._parse_rest_scored_game(item) for item in ex_data)
-
-        return games
-
-    def _parse_rest_scored_game(self, item: dict) -> Game:
-        """Parse a single item from the scores endpoint."""
-        g = item.get("game", item)
-
-        home_data = g.get("homeTeam", {})
-        visitor_data = g.get("visitorTeam", {})
-        final = g.get("finalScore", {}) or {}
-
-        home_rec = self._parse_record_string(home_data.get("record", ""))
-        visitor_rec = self._parse_record_string(visitor_data.get("record", ""))
-
-        # Build period scores from scoresByPeriod
-        periods: dict[str, dict[str, int]] = {}
-        for p in g.get("scoresByPeriod", []):
-            label = p.get("title", "").lower().replace("st", "").replace("nd", "").replace("rd", "").replace("th", "").strip()
-            periods[label] = {
-                "home": int(p.get("homeGoals", 0)),
-                "visitor": int(p.get("visitorGoals", 0)),
-            }
-        periods["total"] = {
-            "home": int(final.get("homeGoals", 0)),
-            "visitor": int(final.get("visitorGoals", 0)),
-        }
-
-        # Detect OT/SO from period titles
-        has_ot = any("ot" in str(p.get("title", "")).lower() for p in g.get("scoresByPeriod", []))
-        has_so = any("so" in str(p.get("title", "")).lower() for p in g.get("scoresByPeriod", []))
-
-        return Game(
-            id=str(g.get("gameId", "")),
-            season_id=self.season_id,
-            status="final",
-            game_type=g.get("type", ""),
-            game_number=str(g.get("number", "")),
-            location="",
-            scheduled_time="",
-            date=g.get("date", item.get("date", "")),
-            home=Team(
-                name=home_data.get("name", ""),
-                id=str(home_data.get("id", "")),
-                logo_url=home_data.get("logo", ""),
-                division=home_data.get("division", ""),
-                **home_rec,
-            ),
-            visitor=Team(
-                name=visitor_data.get("name", ""),
-                id=str(visitor_data.get("id", "")),
-                logo_url=visitor_data.get("logo", ""),
-                division=visitor_data.get("division", ""),
-                **visitor_rec,
-            ),
-            scoreboard=Scoreboard(periods=periods),
-            has_overtime=has_ot,
-            has_shootout=has_so,
-        )
-
-    # ------------------------------------------------------------------
-    # REST API — Schedule (completed + upcoming)
-    # ------------------------------------------------------------------
+        """Completed games for a division (regular season unless exhibition requested)."""
+        return [
+            g for g in self._filter_games(division_id, game_type, include_exhibition)
+            if g.status in ("final", "unofficial")
+        ]
 
     def get_schedule(
         self,
@@ -221,74 +240,16 @@ class GameSheetClient:
         game_type: str = "overall",
         include_exhibition: bool = False,
     ) -> list[Game]:
-        """Fetch full schedule (completed + upcoming) for a division."""
-        base = f"{API_BASE}/useSchedule/getSeasonSchedule/{self.season_id}"
-        params = {
-            "filter[divisions]": division_id,
-            "filter[gametype]": game_type,
-            "filter[limit]": "0",
-        }
+        """Full schedule (completed + upcoming) for a division."""
+        return self._filter_games(division_id, game_type, include_exhibition)
 
-        games = self._parse_schedule_response(self._get(base, params).json())
-
-        if include_exhibition and game_type != "exhibition":
-            params["filter[gametype]"] = "exhibition"
-            games.extend(self._parse_schedule_response(self._get(base, params).json()))
-
-        return games
-
-    def _parse_schedule_response(self, data: dict | list) -> list[Game]:
-        """Parse the schedule endpoint's nested structure."""
-        games: list[Game] = []
-
-        if isinstance(data, dict):
-            groups = data.get("0_0", [])
-        else:
-            groups = data
-
-        for group in groups:
-            group_date = group.get("date", "")
-            for g in group.get("games", [group]):
-                home_data = g.get("homeTeam", {})
-                visitor_data = g.get("visitorTeam", {})
-                final = g.get("finalScore") or {}
-
-                periods: dict[str, dict[str, int]] = {}
-                if final:
-                    periods["total"] = {
-                        "home": int(final.get("homeGoals", 0)),
-                        "visitor": int(final.get("visitorGoals", 0)),
-                    }
-
-                status = g.get("status", "")
-                if not status:
-                    status = "final" if final else "upcoming"
-
-                games.append(Game(
-                    id=str(g.get("id", g.get("gameId", ""))),
-                    season_id=self.season_id,
-                    status=status,
-                    game_type=g.get("type", ""),
-                    game_number=str(g.get("number", "")),
-                    location=g.get("location", ""),
-                    scheduled_time=g.get("scheduleStartTime", ""),
-                    date=g.get("date", group_date),
-                    home=Team(
-                        name=home_data.get("name", ""),
-                        id=str(home_data.get("id", "")),
-                        logo_url=home_data.get("logo", ""),
-                        division=home_data.get("division", ""),
-                    ),
-                    visitor=Team(
-                        name=visitor_data.get("name", ""),
-                        id=str(visitor_data.get("id", "")),
-                        logo_url=visitor_data.get("logo", ""),
-                        division=visitor_data.get("division", ""),
-                    ),
-                    scoreboard=Scoreboard(periods=periods),
-                ))
-
-        return games
+    def _filter_games(self, division_id: str, game_type: str, include_exhibition: bool) -> list[Game]:
+        games = [g for g in self.get_season_games() if self._in_division(g, str(division_id))]
+        if game_type == "exhibition":
+            return [g for g in games if g.game_type == "exhibition"]
+        if include_exhibition:
+            return games
+        return [g for g in games if g.game_type != "exhibition"]
 
     # ------------------------------------------------------------------
     # REST API — Player stats (columnar tableData format)
@@ -564,8 +525,13 @@ class GameSheetClient:
         sid = season_id or game.season_id or self.season_id
 
         url = f"{FIRESTORE_BASE}/seasons/{sid}/games/{game_id}"
-        doc = self._get(url).json()
-        fields = doc.get("fields", {})
+        resp = self._session.get(url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 404:
+            # The live doc is created when scoring starts; before puck drop
+            # the game only exists in games/{gid}.
+            return game
+        resp.raise_for_status()
+        fields = resp.json().get("fields", {})
         pv = self._parse_firestore_value
 
         computed = pv(fields.get("computed", {})) or {}

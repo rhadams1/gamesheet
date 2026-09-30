@@ -17,6 +17,7 @@ class Team:
     id: str = ""
     logo_url: str = ""
     division: str = ""
+    division_id: str = ""
     wins: int = 0
     losses: int = 0
     ties: int = 0
